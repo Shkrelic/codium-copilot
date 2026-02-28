@@ -77,11 +77,16 @@ SYSTEM_PRODUCT_JSON_PATHS = [
 ]
 
 # Runtime extensionApiProposals.js locations (authoritative list of implemented proposals)
+_API_PROPOSALS_REL = 'resources/app/out/vs/workbench/api/common/extensionApiProposals.js'
 RUNTIME_API_PROPOSALS_PATHS = [
-    Path('/usr/share/codium/resources/app/out/vs/workbench/api/common/extensionApiProposals.js'),
-    Path('/opt/vscodium-bin/resources/app/out/vs/workbench/api/common/extensionApiProposals.js'),
-    Path('/opt/VSCodium/resources/app/out/vs/workbench/api/common/extensionApiProposals.js'),
-    Path('/snap/codium/current/usr/share/codium/resources/app/out/vs/workbench/api/common/extensionApiProposals.js'),
+    Path('/usr/share/codium') / _API_PROPOSALS_REL,
+    Path('/opt/vscodium-bin') / _API_PROPOSALS_REL,
+    Path('/opt/VSCodium') / _API_PROPOSALS_REL,
+    Path('/snap/codium/current/usr/share/codium') / _API_PROPOSALS_REL,
+    # Flatpak — system-wide install
+    Path('/var/lib/flatpak/app/com.vscodium.codium/current/active/files/share/codium') / _API_PROPOSALS_REL,
+    # Flatpak — per-user install
+    Path.home() / '.local/share/flatpak/app/com.vscodium.codium/current/active/files/share/codium' / _API_PROPOSALS_REL,
 ]
 
 # macOS config directory
@@ -286,6 +291,65 @@ def get_runtime_api_proposals(proposals_js_path: Path) -> Optional[Set[str]]:
     return None
 
 
+def find_runtime_proposals_file_dynamically() -> Optional[Path]:
+    """Search the filesystem for the runtime extensionApiProposals.js file.
+
+    Used as a last resort when none of the hardcoded paths exist (e.g. the
+    VSCodium binary is installed via Flatpak, AppImage, or a non-standard
+    package layout).  The search is restricted to directories that are known
+    to host VSCodium installations so it completes quickly.
+    """
+    # Resolve search roots from the known system product.json locations first
+    # (the runtime file lives in the same app tree as product.json).
+    search_roots: List[str] = []
+    for product_path in SYSTEM_PRODUCT_JSON_PATHS:
+        if product_path.exists():
+            # product.json is at <root>/resources/app/product.json
+            # runtime file is at <root>/resources/app/out/...
+            # product_path.parents[2] is <root> (the VSCodium install root)
+            candidate = (
+                product_path.parent
+                / 'out' / 'vs' / 'workbench' / 'api' / 'common'
+                / 'extensionApiProposals.js'
+            )
+            if candidate.exists():
+                return candidate
+            # Fall through: add the install root so find can search it
+            search_roots.append(str(product_path.parents[2]))
+
+    # Additional well-known base directories
+    for base in [
+        '/usr/share/codium',
+        '/opt/vscodium-bin',
+        '/opt/VSCodium',
+        '/var/lib/flatpak/app/com.vscodium.codium',
+        str(Path.home() / '.local/share/flatpak/app/com.vscodium.codium'),
+    ]:
+        if Path(base).exists() and base not in search_roots:
+            search_roots.append(base)
+
+    if not search_roots:
+        return None
+
+    try:
+        result = subprocess.run(
+            ['find'] + search_roots
+            + ['-maxdepth', '20', '-name', 'extensionApiProposals.js', '-type', 'f'],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        for line in result.stdout.splitlines():
+            p = line.strip()
+            if p:
+                return Path(p)
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        pass
+
+    return None
+
+
 def get_supported_api_proposals() -> Set[str]:
     """Get the list of API proposals that VSCodium actually supports.
 
@@ -296,21 +360,30 @@ def get_supported_api_proposals() -> Set[str]:
     print_info("Detecting supported API proposals...")
 
     # --- Primary: read from VSCodium's compiled runtime proposals file ---
-    for runtime_path in RUNTIME_API_PROPOSALS_PATHS:
-        if runtime_path.exists():
-            print_success(f"Found runtime proposals file: {runtime_path}", 4)
-            proposals = get_runtime_api_proposals(runtime_path)
-            if proposals:
-                print_success(
-                    f"Found {len(proposals)} runtime-implemented API proposals", 4
-                )
-                sample = sorted(proposals)[:5]
-                for prop in sample:
-                    print_info(prop, 6)
-                if len(proposals) > 5:
-                    print_info(f"... and {len(proposals) - 5} more", 6)
-                return proposals
-            print_warning("Could not parse runtime proposals file, falling back", 4)
+    # Check hardcoded paths first, then try a dynamic filesystem search.
+    runtime_path: Optional[Path] = None
+    for p in RUNTIME_API_PROPOSALS_PATHS:
+        if p.exists():
+            runtime_path = p
+            break
+    if runtime_path is None:
+        print_info("Runtime proposals file not found at known paths, searching...", 4)
+        runtime_path = find_runtime_proposals_file_dynamically()
+
+    if runtime_path is not None and runtime_path.exists():
+        print_success(f"Found runtime proposals file: {runtime_path}", 4)
+        proposals = get_runtime_api_proposals(runtime_path)
+        if proposals:
+            print_success(
+                f"Found {len(proposals)} runtime-implemented API proposals", 4
+            )
+            sample = sorted(proposals)[:5]
+            for prop in sample:
+                print_info(prop, 6)
+            if len(proposals) > 5:
+                print_info(f"... and {len(proposals) - 5} more", 6)
+            return proposals
+        print_warning("Could not parse runtime proposals file, falling back", 4)
 
     # --- Fallback: read granted proposals from system product.json ---
     # Note: extensionEnabledApiProposals is a per-extension permission list.
