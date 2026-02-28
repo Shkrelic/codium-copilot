@@ -89,13 +89,27 @@ RUNTIME_API_PROPOSALS_PATHS = [
     Path.home() / '.local/share/flatpak/app/com.vscodium.codium/current/active/files/share/codium' / _API_PROPOSALS_REL,
 ]
 
+# Workbench bundle files — contain the full allApiProposals table embedded.
+# Used as a secondary fallback when extensionApiProposals.js cannot be found
+# (e.g. some package layouts bundle JS files differently).
+_WORKBENCH_BUNDLE_REL = 'resources/app/out/vs/workbench/workbench.desktop.main.js'
+WORKBENCH_BUNDLE_PATHS = [
+    Path('/usr/share/codium') / _WORKBENCH_BUNDLE_REL,
+    Path('/opt/vscodium-bin') / _WORKBENCH_BUNDLE_REL,
+    Path('/opt/VSCodium') / _WORKBENCH_BUNDLE_REL,
+    Path('/snap/codium/current/usr/share/codium') / _WORKBENCH_BUNDLE_REL,
+    Path('/var/lib/flatpak/app/com.vscodium.codium/current/active/files/share/codium') / _WORKBENCH_BUNDLE_REL,
+    Path.home() / '.local/share/flatpak/app/com.vscodium.codium/current/active/files/share/codium' / _WORKBENCH_BUNDLE_REL,
+]
+
 # macOS config directory
 if sys.platform == 'darwin':
+    _macos_base = Path('/Applications/VSCodium.app/Contents/Resources/app')
     USER_CONFIG_DIRS.insert(0, Path.home() / 'Library' / 'Application Support' / 'VSCodium')
-    RUNTIME_API_PROPOSALS_PATHS.insert(0, Path(
-        '/Applications/VSCodium.app/Contents/Resources/app/out'
-        '/vs/workbench/api/common/extensionApiProposals.js'
-    ))
+    RUNTIME_API_PROPOSALS_PATHS.insert(0,
+        _macos_base / 'out/vs/workbench/api/common/extensionApiProposals.js')
+    WORKBENCH_BUNDLE_PATHS.insert(0,
+        _macos_base / 'out/vs/workbench/workbench.desktop.main.js')
 
 # Windows config directory
 if sys.platform == 'win32':
@@ -104,9 +118,11 @@ if sys.platform == 'win32':
         USER_CONFIG_DIRS.insert(0, Path(appdata) / 'VSCodium')
     localappdata = os.environ.get('LOCALAPPDATA')
     if localappdata:
-        RUNTIME_API_PROPOSALS_PATHS.insert(0, Path(localappdata) / 'Programs' / 'VSCodium'
-                                           / 'resources' / 'app' / 'out' / 'vs' / 'workbench'
-                                           / 'api' / 'common' / 'extensionApiProposals.js')
+        _win_base = Path(localappdata) / 'Programs' / 'VSCodium' / 'resources' / 'app'
+        RUNTIME_API_PROPOSALS_PATHS.insert(0,
+            _win_base / 'out' / 'vs' / 'workbench' / 'api' / 'common' / 'extensionApiProposals.js')
+        WORKBENCH_BUNDLE_PATHS.insert(0,
+            _win_base / 'out' / 'vs' / 'workbench' / 'workbench.desktop.main.js')
 
 # Required settings for full Copilot functionality
 COPILOT_SETTINGS = {
@@ -117,6 +133,9 @@ COPILOT_SETTINGS = {
         "debug.enableModelSelection": True
     }
 }
+
+# JS identifiers that can match the proposal pattern but are not API proposals
+_JS_NOISE_WORDS = frozenset({'version', 'exports', 'module', 'define', 'require', 'default'})
 
 
 @dataclass
@@ -272,6 +291,9 @@ def get_runtime_api_proposals(proposals_js_path: Path) -> Optional[Set[str]]:
     The extensionApiProposals.js file is the authoritative source for which
     proposals VSCodium actually implements at runtime.  Each entry has the form:
         "proposalName": { version: N, proposal: "..." }
+
+    This function also works on workbench bundle files which embed the full
+    allApiProposals table in the same key:{ version: N } format.
     """
     try:
         content = proposals_js_path.read_text(encoding='utf-8')
@@ -283,11 +305,46 @@ def get_runtime_api_proposals(proposals_js_path: Path) -> Optional[Set[str]]:
         )
         proposals = set(names)
         # Exclude JS reserved/noise words that can match the pattern
-        proposals.discard('version')
+        proposals -= _JS_NOISE_WORDS
         if proposals:
             return proposals
     except Exception:
         pass
+    return None
+
+
+def find_proposals_in_bundle_files(
+    install_roots: Optional[List[Path]] = None,
+) -> Optional[Set[str]]:
+    """Try to extract API proposals from the workbench desktop bundle.
+
+    Some VSCodium package layouts do not ship extensionApiProposals.js as a
+    separate file; instead, the allApiProposals table is inlined into the main
+    workbench bundle.  This function checks both the hardcoded bundle paths and
+    any additional roots discovered from product.json locations.
+
+    A minimum threshold of 20 distinct proposal names is required to avoid
+    returning noise from large bundle files that may contain many objects with
+    a ``{ version: N }`` shape unrelated to API proposals.
+    """
+    candidates: List[Path] = list(WORKBENCH_BUNDLE_PATHS)
+
+    if install_roots:
+        # install_roots are typically the resources/app directory.
+        # The bundle is at resources/app/out/vs/workbench/workbench.desktop.main.js
+        bundle_rel = Path('out') / 'vs' / 'workbench' / 'workbench.desktop.main.js'
+        for root in install_roots:
+            extra = root / bundle_rel
+            if extra not in candidates:
+                candidates.append(extra)
+
+    for bundle_path in candidates:
+        if bundle_path.exists():
+            proposals = get_runtime_api_proposals(bundle_path)
+            # Apply a minimum threshold to avoid noise from large bundle files
+            if proposals and len(proposals) >= 20:
+                return proposals
+
     return None
 
 
@@ -306,7 +363,7 @@ def find_runtime_proposals_file_dynamically() -> Optional[Path]:
         if product_path.exists():
             # product.json is at <root>/resources/app/product.json
             # runtime file is at <root>/resources/app/out/...
-            # product_path.parents[2] is <root> (the VSCodium install root)
+            # product_path.parent is <root>/resources/app
             candidate = (
                 product_path.parent
                 / 'out' / 'vs' / 'workbench' / 'api' / 'common'
@@ -314,8 +371,8 @@ def find_runtime_proposals_file_dynamically() -> Optional[Path]:
             )
             if candidate.exists():
                 return candidate
-            # Fall through: add the install root so find can search it
-            search_roots.append(str(product_path.parents[2]))
+            # Fall through: add resources/app so find can search it
+            search_roots.append(str(product_path.parent))
 
     # Additional well-known base directories
     for base in [
@@ -353,9 +410,16 @@ def find_runtime_proposals_file_dynamically() -> Optional[Path]:
 def get_supported_api_proposals() -> Set[str]:
     """Get the list of API proposals that VSCodium actually supports.
 
-    Primary source: extensionApiProposals.js (runtime-implemented proposals).
-    Fallback: extensionEnabledApiProposals in system product.json (permission
-    list only — less accurate, may contain stale entries).
+    Detection order (most → least authoritative):
+    1. extensionApiProposals.js  — standalone runtime proposals file.
+    2. workbench.desktop.main.js — workbench bundle that embeds allApiProposals
+       (present in package layouts that do not ship the standalone file).
+    3. Empty set (permissive)    — skip API compatibility checks entirely when
+       neither source can be found.  The product.json extensionEnabledApiProposals
+       allowlist is intentionally NOT used here because it only covers proposals
+       explicitly approved for specific extensions and would incorrectly reject
+       extensions that use newer proposals (e.g. chatHooks) that VSCodium
+       implements but are absent from the allowlist.
     """
     print_info("Detecting supported API proposals...")
 
@@ -383,56 +447,54 @@ def get_supported_api_proposals() -> Set[str]:
             if len(proposals) > 5:
                 print_info(f"... and {len(proposals) - 5} more", 6)
             return proposals
-        print_warning("Could not parse runtime proposals file, falling back", 4)
+        print_warning("Could not parse runtime proposals file, trying bundle...", 4)
 
-    # --- Fallback: read granted proposals from system product.json ---
-    # Note: extensionEnabledApiProposals is a per-extension permission list.
-    # It reflects what extensions are *allowed* to use, not what VSCodium
-    # implements.  Use only when the runtime file is unavailable.
+    # --- Secondary: extract from the workbench desktop bundle ---
+    # Some VSCodium package layouts (e.g. certain Debian builds) do not ship
+    # extensionApiProposals.js as a standalone file; the allApiProposals table
+    # is inlined into the main workbench bundle instead.
+    install_roots: List[Path] = []
+    for product_path in SYSTEM_PRODUCT_JSON_PATHS:
+        if product_path.exists():
+            install_roots.append(product_path.parent)  # resources/app dir
+
+    bundle_proposals = find_proposals_in_bundle_files(install_roots or None)
+    if bundle_proposals:
+        print_success(f"Found {len(bundle_proposals)} API proposals from workbench bundle", 4)
+        sample = sorted(bundle_proposals)[:5]
+        for prop in sample:
+            print_info(prop, 6)
+        if len(bundle_proposals) > 5:
+            print_info(f"... and {len(bundle_proposals) - 5} more", 6)
+        return bundle_proposals
+
+    # --- Fallback: skip API compatibility checking ---
+    # The product.json extensionEnabledApiProposals allowlist is NOT used as a
+    # substitute for the runtime proposals file.  That list only reflects which
+    # proposals specific extensions are permitted to use — it does not enumerate
+    # everything VSCodium implements.  Using it causes false negatives (e.g.
+    # chatHooks is implemented in VSCodium 1.100+ but absent from the allowlist).
+    # Returning an empty set makes check_api_compatibility accept all proposals,
+    # which is safer than incorrectly rejecting a compatible extension version.
     system_product_json = None
     for path in SYSTEM_PRODUCT_JSON_PATHS:
         if path.exists():
             system_product_json = path
             break
 
-    if not system_product_json:
-        print_warning("Could not find system product.json", 4)
-        print_info("Will check all extension versions", 4)
-        return set()
+    if system_product_json:
+        print_success(f"Found system product.json: {system_product_json}", 4)
 
-    print_success(f"Found system product.json: {system_product_json}", 4)
     print_warning(
-        "Runtime proposals file not found; using product.json fallback (less accurate)", 4
+        "Runtime proposals file not found; skipping API compatibility check", 4
     )
-
-    try:
-        with system_product_json.open('r') as f:
-            product_data = json.load(f)
-
-        all_proposals = set()
-        enabled_proposals = product_data.get('extensionEnabledApiProposals', {})
-
-        for ext_id, proposals in enabled_proposals.items():
-            for proposal in proposals:
-                base_name = proposal.split('@')[0]
-                all_proposals.add(base_name)
-
-        print_success(f"Found {len(all_proposals)} supported API proposals", 4)
-
-        sample = sorted(list(all_proposals))[:5]
-        for prop in sample:
-            print_info(prop, 6)
-        if len(all_proposals) > 5:
-            print_info(f"... and {len(all_proposals) - 5} more", 6)
-
-        return all_proposals
-
-    except json.JSONDecodeError as e:
-        print_error(f"Invalid JSON in system product.json: {e}", 4)
-        return set()
-    except Exception as e:
-        print_error(f"Failed to read system product.json: {e}", 4)
-        return set()
+    print_info(
+        "All extension versions will be considered API-compatible", 4
+    )
+    print_info(
+        "Install the full VSCodium package to enable accurate API detection", 4
+    )
+    return set()
 
 
 def normalize_api_proposal(proposal: str) -> str:
