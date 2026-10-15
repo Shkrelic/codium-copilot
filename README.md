@@ -1,6 +1,6 @@
 # codium-copilot
 
-Run `python3 'codium-copilot_Version13(1).py'` from the repository directory,
+Run `python3 codium-copilot.py` from the repository directory,
 outside VSCodium, with Python 3.7+ and the `requests` and `packaging` packages installed.
 
 ## Automatic API compatibility repair

@@ -16,13 +16,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 # ---------------------------------------------------------------------------
-# Helpers to import functions from the script (filename contains spaces/parens)
+# Helpers to import functions from the installer script
 # ---------------------------------------------------------------------------
 import importlib.util
 import os
 
 _SCRIPT_PATH = os.path.join(
-    os.path.dirname(__file__), '..', 'codium-copilot_Version13(1).py'
+    os.path.dirname(__file__), '..', 'codium-copilot.py'
 )
 
 spec = importlib.util.spec_from_file_location('codium_copilot', _SCRIPT_PATH)
