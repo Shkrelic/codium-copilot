@@ -38,6 +38,165 @@ normalize_api_proposal = mod.normalize_api_proposal
 is_version_compatible = mod.is_version_compatible
 
 
+class TestApiProposalSynchronization:
+    def test_includes_future_runtime_proposals_without_mutating_input(self):
+        declared = ['chatHooks@6', 'legacyProposal']
+        supported = {'chatHooks', 'environmentPower', 'agentSessionsWorkspace', 'futureApi'}
+        proposals = mod.include_supported_api_proposals(declared, supported)
+        assert proposals == [
+            'chatHooks@6', 'legacyProposal',
+            'agentSessionsWorkspace', 'environmentPower', 'futureApi',
+        ]
+        assert declared == ['chatHooks@6', 'legacyProposal']
+        assert mod.include_supported_api_proposals(proposals, supported) == proposals
+
+    def test_unknown_runtime_does_not_guess_proposals(self):
+        assert mod.include_supported_api_proposals(['chatHooks@6'], set()) == ['chatHooks@6']
+
+    def test_product_configuration_includes_runtime_proposals(self, tmp_path):
+        product_path = tmp_path / 'product.json'
+        product_path.write_text(json.dumps({
+            'otherSetting': True,
+            'extensionEnabledApiProposals': {'other.extension': ['otherApi']},
+        }))
+        declared = {'GitHub.copilot-chat': ['chatHooks@6']}
+        with patch.object(mod, 'find_user_config_dir', return_value=tmp_path):
+            assert mod.update_user_product_json(
+                declared, {'chatHooks', 'environmentPower', 'agentSessionsWorkspace', 'futureApi'}
+            )
+        data = json.loads(product_path.read_text())
+        assert data['otherSetting'] is True
+        assert data['extensionEnabledApiProposals']['other.extension'] == ['otherApi']
+        assert set(data['extensionEnabledApiProposals']['github.copilot-chat']) == {
+            'chatHooks@6', 'chatHooks', 'environmentPower', 'agentSessionsWorkspace', 'futureApi',
+        }
+        assert declared == {'GitHub.copilot-chat': ['chatHooks@6']}
+
+    def test_installed_manifest_is_backed_up_and_synchronized(self, tmp_path):
+        manifest_path = tmp_path / 'package.json'
+        manifest = {
+            'publisher': 'GitHub', 'name': 'copilot-chat', 'version': '0.48.1',
+            'enabledApiProposals': ['chatHooks@6'], 'unrelated': {'keep': True},
+        }
+        original = json.dumps(manifest)
+        manifest_path.write_text(original)
+        supported = {'chatHooks', 'environmentPower', 'agentSessionsWorkspace', 'futureApi'}
+        with patch.object(mod.subprocess, 'run', return_value=MagicMock(stdout=str(tmp_path))) as run:
+            assert mod.update_installed_api_proposals('GitHub.copilot-chat', supported)
+            run.assert_called_once_with(
+                ['codium', '--locate-extension', 'GitHub.copilot-chat'],
+                capture_output=True, text=True, check=True, timeout=10,
+            )
+        updated = json.loads(manifest_path.read_text())
+        assert updated['unrelated'] == {'keep': True}
+        assert updated['version'] == '0.48.1'
+        assert set(updated['enabledApiProposals']) == {
+            'chatHooks@6', 'environmentPower', 'agentSessionsWorkspace', 'futureApi',
+        }
+        backup_path = tmp_path / 'package.json.copilot-backup'
+        assert backup_path.read_text() == original
+        with patch.object(mod.subprocess, 'run', return_value=MagicMock(stdout=str(tmp_path))):
+            assert mod.update_installed_api_proposals('GitHub.copilot-chat', supported)
+        assert backup_path.read_text() == original
+
+    @pytest.mark.parametrize('output', ['', 'relative/extension'])
+    def test_invalid_location_fails(self, output):
+        with patch.object(mod.subprocess, 'run', return_value=MagicMock(stdout=output)):
+            assert not mod.update_installed_api_proposals('GitHub.copilot-chat', {'environmentPower'})
+
+    @pytest.mark.parametrize('manifest', [
+        {'publisher': 'Other', 'name': 'extension'},
+        {'publisher': 'GitHub', 'name': 'copilot-chat', 'enabledApiProposals': 'invalid'},
+        {'publisher': 'GitHub', 'name': 'copilot-chat', 'enabledApiProposals': [None]},
+    ])
+    def test_invalid_manifest_is_not_modified(self, tmp_path, manifest):
+        manifest_path = tmp_path / 'package.json'
+        original = json.dumps(manifest)
+        manifest_path.write_text(original)
+        with patch.object(mod.subprocess, 'run', return_value=MagicMock(stdout=str(tmp_path))):
+            assert not mod.update_installed_api_proposals('GitHub.copilot-chat', {'environmentPower'})
+        assert manifest_path.read_text() == original
+        assert not (tmp_path / 'package.json.copilot-backup').exists()
+
+    def test_missing_runtime_is_reported_as_failure(self):
+        with patch.object(mod.subprocess, 'run') as run:
+            assert not mod.update_installed_api_proposals('GitHub.copilot-chat', set())
+        run.assert_not_called()
+
+    def test_missing_runtime_stops_before_removing_extensions(self):
+        with patch.multiple(
+            mod,
+            check_not_running_in_codium=MagicMock(),
+            check_dependencies=MagicMock(),
+            get_codium_version=MagicMock(return_value='1.140.0'),
+            get_supported_api_proposals=MagicMock(return_value=set()),
+        ), patch.object(mod, 'cleanup_existing_extensions') as cleanup:
+            assert mod.main() == 1
+        cleanup.assert_not_called()
+
+    @pytest.mark.parametrize('error', [
+        FileNotFoundError('codium'),
+        mod.subprocess.TimeoutExpired('codium', 10),
+        mod.subprocess.CalledProcessError(1, 'codium'),
+    ])
+    def test_locate_errors_are_reported_as_failure(self, error):
+        with patch.object(mod.subprocess, 'run', side_effect=error):
+            assert not mod.update_installed_api_proposals('GitHub.copilot-chat', {'futureApi'})
+
+    def test_failed_atomic_replace_preserves_manifest(self, tmp_path):
+        manifest_path = tmp_path / 'package.json'
+        original = json.dumps({'publisher': 'GitHub', 'name': 'copilot-chat'})
+        manifest_path.write_text(original)
+        with patch.object(mod.subprocess, 'run', return_value=MagicMock(stdout=str(tmp_path))):
+            with patch.object(Path, 'replace', side_effect=PermissionError('read-only')):
+                assert not mod.update_installed_api_proposals('GitHub.copilot-chat', {'futureApi'})
+        assert manifest_path.read_text() == original
+        assert sorted(p.name for p in tmp_path.iterdir()) == [
+            'package.json', 'package.json.copilot-backup',
+        ]
+
+    @pytest.mark.parametrize('install_ok, repair_ok, expected', [
+        (True, True, 0), (True, False, 1), (False, True, 1),
+    ])
+    def test_main_repairs_before_startup(self, tmp_path, install_ok, repair_ok, expected):
+        compatible = mod.CompatibleVersion('0.48.1', '^1.120.0', 'https://example.com/copilot.vsix')
+        mocks = {
+            name: MagicMock() for name in (
+                'check_not_running_in_codium', 'check_dependencies', 'cleanup_existing_extensions',
+                'terminate_codium', 'cleanup_files',
+            )
+        }
+        mocks.update({
+            'get_codium_version': MagicMock(return_value='1.140.0'),
+            'get_supported_api_proposals': MagicMock(return_value={'environmentPower'}),
+            'query_marketplace': MagicMock(return_value={'versions': []}),
+            'find_compatible_version_with_api_check': MagicMock(return_value=compatible),
+            'download_vsix': MagicMock(return_value=tmp_path / 'copilot.vsix'),
+            'extract_api_proposals_from_vsix': MagicMock(return_value=['chatHooks']),
+            'update_user_product_json': MagicMock(return_value=True),
+            'update_user_settings': MagicMock(return_value=True),
+            'install_extension': MagicMock(return_value=install_ok),
+            'update_installed_api_proposals': MagicMock(return_value=repair_ok),
+            'validate_installation': MagicMock(return_value=True),
+        })
+        with patch.multiple(mod, **mocks), patch.object(mod.subprocess, 'Popen') as start:
+            assert mod.main() == expected
+        if install_ok:
+            mocks['update_installed_api_proposals'].assert_called_once_with(
+                'GitHub.copilot-chat', {'environmentPower'},
+            )
+        else:
+            mocks['update_installed_api_proposals'].assert_not_called()
+        if expected == 0:
+            start.assert_called_once_with(
+                ['codium', '--enable-proposed-api', 'GitHub.copilot-chat'],
+                stdout=mod.subprocess.DEVNULL, stderr=mod.subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        else:
+            start.assert_not_called()
+
+
 # ===========================================================================
 # Fixtures – simulated VSCodium 1.109 file content
 # ===========================================================================

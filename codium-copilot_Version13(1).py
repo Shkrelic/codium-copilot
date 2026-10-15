@@ -7,6 +7,7 @@ by checking which API proposals are actually available in your VSCodium installa
 
 Features:
 - Smart API compatibility detection
+- Automatic synchronization of installed Copilot API declarations
 - Automatic version finding
 - User-level product.json configuration (survives updates)
 - Model selector enablement
@@ -29,6 +30,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
 import zipfile
 from dataclasses import dataclass
@@ -502,6 +504,16 @@ def normalize_api_proposal(proposal: str) -> str:
     return proposal.split('@')[0]
 
 
+def include_supported_api_proposals(
+    declared_proposals: List[str], supported_apis: Set[str]
+) -> List[str]:
+    """Include runtime proposals without losing declared proposal versions."""
+    proposals = list(declared_proposals)
+    declared_names = {normalize_api_proposal(prop) for prop in proposals}
+    proposals.extend(sorted(supported_apis - declared_names))
+    return proposals
+
+
 def check_api_compatibility(
     required_proposals: List[str],
     supported_proposals: Set[str]
@@ -602,6 +614,7 @@ def update_user_product_json(
         # Update with extracted API proposals.
         # Normalize extension IDs to lowercase to match VSCodium's lookup convention.
         for ext_id, proposals in extension_proposals.items():
+            proposals = include_supported_api_proposals(proposals, supported_apis)
             if proposals:
                 norm_id = ext_id.lower()
                 existing_data['extensionEnabledApiProposals'][norm_id] = proposals
@@ -621,34 +634,6 @@ def update_user_product_json(
 
             if unversioned_added:
                 print_info(f"Added {len(unversioned_added)} unversioned API variants", 4)
-
-        # Add critical proposals that might be missing — only if VSCodium actually
-        # implements them (present in supported_apis).  Adding unimplemented proposals
-        # causes VSCodium to report them as incompatible at runtime.
-        critical_proposals = [
-            'languageModelPicker',
-            'chatParticipantPrivate',
-            'defaultChatParticipant',
-            'chatSessionsProvider',
-            'chatProvider',
-            'findFiles2',
-        ]
-
-        for ext_id in list(extension_proposals.keys()):
-            norm_id = ext_id.lower()
-            proposals = existing_data['extensionEnabledApiProposals'].get(norm_id, [])
-            added_critical = []
-            for prop in critical_proposals:
-                # Only grant proposals that VSCodium can actually serve at runtime.
-                # When supported_apis is empty, detection failed (no runtime file or
-                # product.json found); fall back to allowing all critical proposals so
-                # the extension has the best chance of working.
-                if prop not in proposals and (not supported_apis or prop in supported_apis):
-                    proposals.append(prop)
-                    added_critical.append(prop)
-
-            if added_critical:
-                print_info(f"Added {len(added_critical)} critical proposals", 4)
 
         with product_json_path.open('w') as f:
             json.dump(existing_data, f, indent=2)
@@ -1096,6 +1081,58 @@ def install_extension(vsix_path: Path, extension_name: str) -> bool:
     return False
 
 
+def update_installed_api_proposals(extension_id: str, supported_apis: Set[str]) -> bool:
+    """Synchronize the installed manifest after the normal VSIX installation."""
+    if not supported_apis:
+        print_warning(
+            "Runtime API detection failed; cannot repair undeclared API requirements. "
+            "No additional proposals will be guessed."
+        )
+        return False
+
+    try:
+        result = subprocess.run(
+            ['codium', '--locate-extension', extension_id],
+            capture_output=True, text=True, check=True, timeout=10
+        )
+        extension_path = Path(result.stdout.strip())
+        if not result.stdout.strip() or not extension_path.is_absolute():
+            raise ValueError("VSCodium did not return an absolute extension path")
+        manifest_path = extension_path / 'package.json'
+        original = manifest_path.read_bytes()
+        manifest = json.loads(original)
+        actual_id = f"{manifest.get('publisher', '')}.{manifest.get('name', '')}"
+        if actual_id.lower() != extension_id.lower():
+            raise ValueError(f"Unexpected extension manifest: {actual_id}")
+        declared = manifest.get('enabledApiProposals', [])
+        if not isinstance(declared, list) or not all(isinstance(p, str) for p in declared):
+            raise ValueError("Invalid enabledApiProposals in extension manifest")
+
+        proposals = include_supported_api_proposals(declared, supported_apis)
+        if proposals == declared:
+            return True
+        manifest['enabledApiProposals'] = proposals
+
+        backup_path = manifest_path.with_name('package.json.copilot-backup')
+        try:
+            with backup_path.open('xb') as backup:
+                backup.write(original)
+        except FileExistsError:
+            pass
+
+        # Replace atomically so a failed write cannot truncate the installed manifest.
+        with tempfile.TemporaryDirectory(dir=extension_path) as staging:
+            staged_path = Path(staging) / 'package.json'
+            staged_path.write_text(json.dumps(manifest, indent=2) + '\n', encoding='utf-8')
+            staged_path.chmod(manifest_path.stat().st_mode & 0o777)
+            staged_path.replace(manifest_path)
+        print_success(f"Added {len(proposals) - len(declared)} runtime API proposals to {extension_id}")
+        return True
+    except (OSError, ValueError, subprocess.SubprocessError) as e:
+        print_error(f"Could not configure installed API proposals for {extension_id}: {e}")
+        return False
+
+
 def is_extension_installed(extension_name: str) -> bool:
     """Check if a specific extension is installed."""
     try:
@@ -1182,6 +1219,12 @@ def main() -> int:
     # Step 2: Detect supported API proposals
     print_step(2, total_steps, "Detecting Supported API Proposals")
     supported_apis = get_supported_api_proposals()
+    if not supported_apis:
+        print_error(
+            "Cannot safely configure Copilot without detecting runtime API proposals. "
+            "Install the full VSCodium package and rerun this script."
+        )
+        return 1
 
     # Step 3: Find compatible version
     print_step(3, total_steps, "Finding Compatible Extension")
@@ -1237,8 +1280,8 @@ def main() -> int:
 
     for filepath, ext_name, ext_id in downloaded_files:
         proposals = extract_api_proposals_from_vsix(filepath, ext_id)
+        extension_proposals[ext_id] = proposals
         if proposals:
-            extension_proposals[ext_id] = proposals
             print_info(f"Extracted {len(proposals)} API proposals from {ext_name}", 4)
 
     # Step 7: Update user product.json
@@ -1253,8 +1296,10 @@ def main() -> int:
     print_step(9, total_steps, "Installing Extension")
     install_success = True
 
-    for filepath, ext_name, _ in downloaded_files:
+    for filepath, ext_name, ext_id in downloaded_files:
         if not install_extension(filepath, ext_name):
+            install_success = False
+        elif not update_installed_api_proposals(ext_id, supported_apis):
             install_success = False
 
     # Step 10: Validate & Cleanup
@@ -1285,7 +1330,7 @@ def main() -> int:
 
         try:
             subprocess.Popen(
-                ['codium'],
+                ['codium', '--enable-proposed-api'] + [ext.extension_id for ext, _ in downloads],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 start_new_session=True
@@ -1308,6 +1353,9 @@ def main() -> int:
 
     if not settings_success:
         print_warning("Settings were not updated", 0)
+
+    if not install_success:
+        print_warning("Extension installation or API declaration repair failed", 0)
 
     if not validation_ok:
         print_warning("Extension validation failed", 0)
