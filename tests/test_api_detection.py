@@ -84,7 +84,7 @@ class TestApiProposalSynchronization:
         with patch.object(mod.subprocess, 'run', return_value=MagicMock(stdout=str(tmp_path))) as run:
             assert mod.update_installed_api_proposals('GitHub.copilot-chat', supported)
             run.assert_called_once_with(
-                ['codium', '--locate-extension', 'GitHub.copilot-chat'],
+                ['codium', '--locate-extension', 'github.copilot-chat'],
                 capture_output=True, text=True, check=True, timeout=10,
             )
         updated = json.loads(manifest_path.read_text())

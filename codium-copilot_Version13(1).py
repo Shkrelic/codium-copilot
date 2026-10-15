@@ -1092,7 +1092,7 @@ def update_installed_api_proposals(extension_id: str, supported_apis: Set[str]) 
 
     try:
         result = subprocess.run(
-            ['codium', '--locate-extension', extension_id],
+            ['codium', '--locate-extension', extension_id.lower()],
             capture_output=True, text=True, check=True, timeout=10
         )
         extension_path = Path(result.stdout.strip())
