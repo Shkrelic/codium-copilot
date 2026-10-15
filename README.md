@@ -7,6 +7,8 @@ outside VSCodium, with Python 3.7+ and the `requests` and `packaging` packages i
 
 The installer detects the proposals implemented by your installed VSCodium runtime
 and checks the extension's declared requirements before choosing a version.
+It reads the standalone proposals file when available, or the embedded table in
+`workbench.desktop.main.js` on bundle-only installations such as Fedora packages.
 After installing the original VSIX, it adds runtime-supported proposals to the
 installed Copilot Chat manifest and its user-level `product.json` allowlist.
 This handles undeclared requirements such as `environmentPower` and
