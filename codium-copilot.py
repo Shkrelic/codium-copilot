@@ -291,18 +291,23 @@ def get_runtime_api_proposals(proposals_js_path: Path) -> Optional[Set[str]]:
     """Extract implemented API proposal names from VSCodium's runtime JS file.
 
     The extensionApiProposals.js file is the authoritative source for which
-    proposals VSCodium actually implements at runtime.  Each entry has the form:
-        "proposalName": { version: N, proposal: "..." }
+    proposals VSCodium actually implements at runtime.  Entries contain a
+    proposal string and/or a numeric version, in either property order:
+        "proposalName": { proposal: "...", version: N }
+    The version property is optional in newer compiled bundles.
 
     This function also works on workbench bundle files which embed the full
-    allApiProposals table in the same key:{ version: N } format.
+    allApiProposals table.
     """
     try:
         content = proposals_js_path.read_text(encoding='utf-8')
-        # Match both quoted and unquoted keys followed by '{ version:'
-        # This is the exact structure used in allApiProposals.
+        # Skip preceding scalar properties, consuming strings as whole values
+        # so their contents cannot be mistaken for proposal/version properties.
         names = re.findall(
-            r'["\']?([a-zA-Z][a-zA-Z0-9_]*)["\']?\s*:\s*\{\s*version\s*:\s*\d',
+            r'["\']?([a-zA-Z][a-zA-Z0-9_]*)["\']?\s*:\s*\{\s*'
+            r'(?:["\']?[a-zA-Z_$][\w$]*["\']?\s*:\s*'
+            r'(?:"(?:\\.|[^"\\])*"|\'(?:\\.|[^\'\\])*\'|[\w.]+)\s*,\s*)*?'
+            r'(?:["\']?proposal["\']?\s*:\s*["\']|["\']?version["\']?\s*:\s*\d)',
             content
         )
         proposals = set(names)

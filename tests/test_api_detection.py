@@ -276,6 +276,17 @@ PROPOSALS_JS_MINIFIED = (
     'exports.allApiProposals=allApiProposals;'
 )
 
+# Fedora/VSCodium bundles can omit version entirely.
+PROPOSALS_JS_PROPOSAL_ONLY = (
+    'const allApiProposals=Object.freeze({'
+    + ','.join(
+        f'{entry.split(":")[0]}:{{proposal:"https://raw.githubusercontent.com/'
+        f'microsoft/vscode/main/src/vscode-dts/vscode.proposed.{entry.split(":")[0]}.d.ts"}}'
+        for entry in _BUNDLE_PROPOSALS
+    )
+    + '});'
+)
+
 # Proposals required by GitHub Copilot Chat 0.37.6–0.37.9 (the versions that
 # the user expected to install but which were rejected).
 COPILOT_CHAT_0_37_6_REQUIRED = [
@@ -382,6 +393,34 @@ class TestGetRuntimeApiProposals:
         content = 'const x = { foo: { version: 1, proposal: "..." } };'
         result = self._write_and_parse(content)
         assert 'foo' in result
+
+    @pytest.mark.parametrize('body', [
+        'proposal:"https://example.com/vscode.proposed.chatParticipantPrivate.d.ts"',
+        'proposal:"...",version:3',
+        'version:3,proposal:"..."',
+        'description:"API metadata",proposal:"..."',
+        'description:"API {metadata}, \\"quoted\\"",proposal:"..."',
+        '"proposal":"...","version":3',
+        "'version':3,'proposal':'...'",
+        'version:3',
+    ])
+    def test_proposal_properties_independent_of_order(self, body):
+        content = f'const x={{chatParticipantPrivate:{{{body}}}}};'
+        assert self._write_and_parse(content) == {'chatParticipantPrivate'}
+
+    def test_unrelated_objects_and_noise_words_excluded(self):
+        content = (
+            'const x={'
+            'settings:{conversion:3},'
+            'metadata:{proposalCount:25},'
+            'description:{text:"proposal: not an API, version:3"},'
+            'packageInfo:{version:"1.0"},'
+            'exports:{proposal:"..."},'
+            'module:{version:1},'
+            'chatParticipantPrivate:{proposal:"..."}'
+            '};'
+        )
+        assert self._write_and_parse(content) == {'chatParticipantPrivate'}
 
     def test_quoted_keys_detected(self):
         content_quoted = (
@@ -606,6 +645,24 @@ class TestGetSupportedApiProposals:
         assert 'chatHooks' in result
         assert len(result) >= 20
 
+    def test_fedora_proposal_only_bundle_discovered_from_product_json(self, tmp_path):
+        app_dir = tmp_path / 'usr/share/codium/resources/app'
+        bundle_file = app_dir / 'out/vs/workbench/workbench.desktop.main.js'
+        bundle_file.parent.mkdir(parents=True)
+        bundle_file.write_text(PROPOSALS_JS_PROPOSAL_ONLY, encoding='utf-8')
+        product_file = app_dir / 'product.json'
+        product_file.write_text('{}', encoding='utf-8')
+
+        with patch.multiple(
+            mod,
+            RUNTIME_API_PROPOSALS_PATHS=[],
+            WORKBENCH_BUNDLE_PATHS=[],
+            SYSTEM_PRODUCT_JSON_PATHS=[product_file],
+        ), patch.object(mod, 'find_runtime_proposals_file_dynamically', return_value=None):
+            result = get_supported_api_proposals()
+
+        assert result == {entry.split(':')[0] for entry in _BUNDLE_PROPOSALS}
+
     def test_permissive_fallback_when_no_source_found(self, tmp_path):
         """
         Fallback path: neither the standalone file nor the bundle exists.
@@ -728,6 +785,20 @@ class TestGetSupportedApiProposals:
 # ===========================================================================
 
 class TestFindProposalsInBundleFiles:
+    @pytest.mark.parametrize('count', [19, 20])
+    def test_proposal_only_bundle_threshold_excludes_noise(self, tmp_path, count):
+        names = {entry.split(':')[0] for entry in _BUNDLE_PROPOSALS[:count]}
+        bundle_file = tmp_path / 'workbench.desktop.main.js'
+        bundle_file.write_text(
+            'const x={'
+            + ','.join(f'{name}:{{proposal:"..."}}' for name in sorted(names))
+            + ',exports:{proposal:"..."},module:{version:1}};',
+            encoding='utf-8',
+        )
+        with patch.object(mod, 'WORKBENCH_BUNDLE_PATHS', [bundle_file]):
+            result = find_proposals_in_bundle_files()
+        assert result == (names if count >= 20 else None)
+
     def test_finds_chatHooks_from_bundle(self, tmp_path):
         # The bundle must contain >= 20 proposals to pass the noise threshold
         bundle_file = tmp_path / 'workbench.desktop.main.js'
